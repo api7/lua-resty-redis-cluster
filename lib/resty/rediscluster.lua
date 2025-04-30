@@ -30,27 +30,27 @@ local DEFAULT_SEND_TIMEOUT = 1000
 local DEFAULT_READ_TIMEOUT = 1000
 local DEFAULT_HEALTH_DICT_NAME = "redis_cluster_health"
 local err_unhealthy_master = "master node is unhealthy"
-
+local health_check_running = false
 local function generate_key(name, ip, port)
     return name .. ":" .. ip .. ":" .. port
 end
 
 
-local function health_check_timer(premature)
+local function run_health_check(premature)
     if premature then
         return
     end
 
-    local health_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
-    if not health_dict then
+    local unhealthy_nodes_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
+    if not unhealthy_nodes_dict then
         return
     end
 
-    local all_keys = health_dict:get_keys()
+    local all_keys = unhealthy_nodes_dict:get_keys()
     for _, key in ipairs(all_keys) do
         local ip, port = string.match(key, "^[^:]+:([^:]+):(%d+)$")
         if not ip or not port then
-            health_dict:delete(key)
+            unhealthy_nodes_dict:delete(key)
             goto continue
         end
         port = tonumber(port)
@@ -72,25 +72,26 @@ local function health_check_timer(premature)
         end
         -- Update health status based on check
         if ok then
-            health_dict:delete(key)
+            unhealthy_nodes_dict:delete(key)
             ngx.log(ngx.WARN, "health check success for: ", ip, ":", port)
         else
-            local failures = health_dict:get(key) or 0
-            health_dict:set(key, failures + 1, 60)  -- Unhealthy: increment failures with TTL
-            ngx.log(ngx.WARN, "health check failed for: ", ip, ":", port, "failures: ", failures + 1)
+            local failures = unhealthy_nodes_dict:get(key) or 0
+            unhealthy_nodes_dict:set(key, failures + 1, 60)  -- Unhealthy: increment failures with TTL
+            ngx.log(ngx.ERR, "health check failed for: ", ip, ":", port, " - failures: ", failures + 1)
         end
 
         ::continue::
     end
 end
 
+
 local function track_node_failure(ip, port, name)
-    local health_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
-    if not health_dict then
+    local unhealthy_nodes_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
+    if not unhealthy_nodes_dict then
         return
     end
     local key = generate_key(name, ip, port)
-    health_dict:incr(key, 1, 0, 60)
+    unhealthy_nodes_dict:incr(key, 1, 0, 60)
 end
 
 local function parse_key(key_str)
@@ -113,15 +114,23 @@ local slot_cache = {}
 local master_nodes = {}
 
 
+local function health_check(premature)
+    if health_check_running then
+        return
+    end
+    health_check_running = true
+    pcall(run_health_check, premature)
+    health_check_running = false
+end
 
 local function is_node_healthy(ip, port, name)
-    local health_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
-    if not health_dict then
+    local unhealthy_nodes_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
+    if not unhealthy_nodes_dict then
         return true
     end
 
     local key = generate_key(name, ip, port)
-    local is_healthy = (health_dict:get(key) or 0) <= 3
+    local is_healthy = (unhealthy_nodes_dict:get(key) or 0) <= 3
     return is_healthy
 end
 
@@ -342,7 +351,7 @@ function _M.refresh_slots(self)
 
     self:fetch_slots()
     -- Cleanup health dict entries for removed nodes
-    local health_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
+    local unhealthy_nodes_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
     local current_nodes = {}
     local servers = slot_cache[self.config.name .. "serv_list"].serv_list
     for _, node in ipairs(servers) do
@@ -350,10 +359,10 @@ function _M.refresh_slots(self)
         current_nodes[key] = true
     end
     -- Cleanup stale nodes
-    local all_keys = health_dict:get_keys()
+    local all_keys = unhealthy_nodes_dict:get_keys()
     for _, key in ipairs(all_keys) do
         if not current_nodes[key] then
-            health_dict:delete(key)
+            unhealthy_nodes_dict:delete(key)
         end
     end
 
@@ -920,7 +929,7 @@ setmetatable(_M, {
 })
 
 function _M.init()
-    ngx.timer.every(1, health_check_timer)
+    ngx.timer.every(1, health_check)
 end
 
 return _M
