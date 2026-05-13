@@ -929,4 +929,52 @@ GET /t
 ^.*failed to fetch slots: connection refused.*$
 --- timeout: 3
 --- no_error_log
+
+
+
+=== TEST 14: evalsha NOSCRIPT returns error without crash
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua '
+            local config = {
+                            name = "testCluster",
+                            serv_list = {
+                                            { ip = "127.0.0.1", port = 7000 },
+                                            { ip = "127.0.0.1", port = 7001 },
+                                            { ip = "127.0.0.1", port = 7002 },
+                                            { ip = "127.0.0.1", port = 7003 },
+                                            { ip = "127.0.0.1", port = 7004 },
+                                            { ip = "127.0.0.1", port = 7005 },
+                                            { ip = "127.0.0.1", port = 7006 }
+                                        },
+                            keepalive_timeout = 60000,
+                            keepalive_cons = 1000,
+                            connect_timeout = 1000,
+                            read_timeout = 1000,
+                            send_timeout = 1000,
+                            max_redirection = 5
+            }
+            local redis = require "resty.rediscluster"
+            local red, err = redis:new(config)
+            if err then
+                ngx.say("failed to create: ", err)
+                return
+            end
+
+            -- Use a fake SHA that does not exist on any node
+            local res, err = red:evalsha("0000000000000000000000000000000000000000", 1, "noscript_test_key")
+            if err then
+                ngx.say("evalsha error: ", err)
+            else
+                ngx.say("evalsha result: ", tostring(res))
+            end
+        ';
+    }
+--- request
+GET /t
+--- response_body_like
+^evalsha error: NOSCRIPT.*$
+--- no_error_log
+[error]
 [alert]

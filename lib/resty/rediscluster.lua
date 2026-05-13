@@ -352,17 +352,19 @@ function _M.refresh_slots(self)
     self:fetch_slots()
     -- Cleanup health dict entries for removed nodes
     local unhealthy_nodes_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
-    local current_nodes = {}
-    local servers = slot_cache[self.config.name .. "serv_list"].serv_list
-    for _, node in ipairs(servers) do
-        local key = generate_key(self.config.name, node.ip, node.port)
-        current_nodes[key] = true
-    end
-    -- Cleanup stale nodes
-    local all_keys = unhealthy_nodes_dict:get_keys()
-    for _, key in ipairs(all_keys) do
-        if not current_nodes[key] then
-            unhealthy_nodes_dict:delete(key)
+    if unhealthy_nodes_dict then
+        local current_nodes = {}
+        local servers = slot_cache[self.config.name .. "serv_list"].serv_list
+        for _, node in ipairs(servers) do
+            local key = generate_key(self.config.name, node.ip, node.port)
+            current_nodes[key] = true
+        end
+        -- Cleanup stale nodes
+        local all_keys = unhealthy_nodes_dict:get_keys()
+        for _, key in ipairs(all_keys) do
+            if not current_nodes[key] then
+                unhealthy_nodes_dict:delete(key)
+            end
         end
     end
 
@@ -635,6 +637,8 @@ local function handle_command_with_retry(self, target_ip, target_port, asking, c
 
                 elseif string.sub(err, 1, 11) == "CLUSTERDOWN" then
                     return nil, "Cannot executing command, cluster status is failed!"
+                elseif string.sub(err, 1, 8) == "NOSCRIPT" then
+                    return nil, err
                 else
                     --There might be node fail, we should also refresh slot cache
                     track_node_failure(ip, port, self.config.name)
