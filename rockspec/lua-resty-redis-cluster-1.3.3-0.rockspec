@@ -2,7 +2,7 @@ package = "lua-resty-redis-cluster"
 version = "1.3.3-0"
 
 source = {
-    url = "git://github.com/iresty/lua-resty-redis-cluster",
+    url = "git+https://github.com/iresty/lua-resty-redis-cluster.git",
     tag = "v1.3.3"
 }
 
