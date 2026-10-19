@@ -4,7 +4,10 @@ LUA_INCLUDE_DIR ?= $(PREFIX)/include
 LUA_LIB_DIR ?=     $(PREFIX)/lib/lua/$(LUA_VERSION)
 INSTALL ?= install
 
-.PHONY: all test install
+LUAJIT ?= $(OPENRESTY_PREFIX)/luajit/bin/luajit
+TEST_NGINX_LIB ?= ../test-nginx/lib
+
+.PHONY: all test test-unit test-health install
 
 all: ;
 
@@ -12,6 +15,14 @@ install: all
 	$(INSTALL) -d $(DESTDIR)$(LUA_LIB_DIR)/resty
 	$(INSTALL) lib/resty/*.lua $(DESTDIR)$(LUA_LIB_DIR)/resty
 
-test: all
-	PATH=$(OPENRESTY_PREFIX)/nginx/sbin:$$PATH prove -I../test-nginx/lib -r t
+test: all test-unit
+	PATH=$(OPENRESTY_PREFIX)/nginx/sbin:$$PATH prove -I$(TEST_NGINX_LIB) -r t
+
+test-unit:
+	LUA_PATH="$$LUA_PATH;$(OPENRESTY_PREFIX)/lualib/?.lua;;" \
+	LUA_CPATH="$$LUA_CPATH;$(OPENRESTY_PREFIX)/lualib/?.so;;" \
+	HEALTH_CHECK_REAL_CJSON=1 $(LUAJIT) t/health_check.lua
+
+test-health:
+	PATH=$(OPENRESTY_PREFIX)/nginx/sbin:$$PATH prove -I$(TEST_NGINX_LIB) t/health-check.t
 

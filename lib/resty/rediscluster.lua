@@ -1,4 +1,5 @@
 local redis = require "resty.redis"
+local cjson = require "cjson.safe"
 local resty_lock = require "resty.lock"
 local xmodem = require "resty.xmodem"
 local setmetatable = setmetatable
@@ -31,8 +32,55 @@ local DEFAULT_READ_TIMEOUT = 1000
 local DEFAULT_HEALTH_DICT_NAME = "redis_cluster_health"
 local err_unhealthy_master = "master node is unhealthy"
 local health_check_running = false
+local check_auth
+local HEALTH_CONFIG_PREFIX = "config:"
 local function generate_key(name, ip, port)
     return name .. ":" .. ip .. ":" .. port
+end
+
+
+local function generate_config_key(name)
+    return HEALTH_CONFIG_PREFIX .. name
+end
+
+
+local function is_config_key(key)
+    return string.sub(key, 1, #HEALTH_CONFIG_PREFIX) == HEALTH_CONFIG_PREFIX
+        and not string.match(key, "^[^:]+:[^:]+:%d+$")
+end
+
+
+local function save_health_config(dict, config, update_existing)
+    local key = generate_config_key(config.name)
+    local current = dict:get(key)
+    -- Publish credentials only for clusters with failures. New clients update
+    -- an existing snapshot; an older in-flight failure must not overwrite it.
+    if update_existing and not current or not update_existing and current then
+        return true
+    end
+
+    local serialized, err = cjson.encode({
+        connect_opts = config.connect_opts,
+        auth = config.auth,
+    })
+    if serialized == current and serialized then
+        return true
+    end
+    local ok
+    if serialized then
+        if update_existing then
+            ok, err = dict:safe_set(key, serialized, 60)
+        else
+            ok, err = dict:safe_add(key, serialized, 60)
+            if err == "exists" then return true end
+        end
+    end
+    if not ok then
+        if update_existing then dict:delete(key) end
+        ngx.log(ngx.ERR, "failed to save health check config: ", err)
+        return nil
+    end
+    return true
 end
 
 
@@ -46,38 +94,65 @@ local function run_health_check(premature)
         return
     end
 
-    local all_keys = unhealthy_nodes_dict:get_keys()
+    local all_keys = unhealthy_nodes_dict:get_keys(0)
     for _, key in ipairs(all_keys) do
-        local ip, port = string.match(key, "^[^:]+:([^:]+):(%d+)$")
-        if not ip or not port then
+        if is_config_key(key) then
+            goto continue
+        end
+        local name, ip, port = string.match(key, "^([^:]+):([^:]+):(%d+)$")
+        if not name or not ip or not port then
             unhealthy_nodes_dict:delete(key)
             goto continue
         end
+        local config_key = generate_config_key(name)
+        local serialized_config = unhealthy_nodes_dict:get(config_key)
+        local config = serialized_config and cjson.decode(serialized_config)
+        if type(config) ~= "table" then
+            -- Without configuration the agent cannot probe this node. Allow
+            -- business requests to retry and publish a fresh failure record.
+            unhealthy_nodes_dict:delete(key)
+            goto continue
+        end
+        -- Renew in place: never write an old snapshot back after network I/O.
+        unhealthy_nodes_dict:expire(config_key, 60)
         port = tonumber(port)
-        local ok
         -- Create a new Redis client for each check
         local red = redis:new()
         red:set_timeouts(500, 500, 500)  -- 500ms for connect/send/read
         ngx.log(ngx.WARN, "health check for: ", ip, ":", port)
         -- Attempt to connect and send PING
-        local ok, err = red:connect(ip, port)
+        local ok, err = red:connect(ip, port, config.connect_opts)
+        local connected = ok
+        if ok then
+            ok, err = check_auth({ config = config }, red)
+        end
         if ok then
             -- Check if PING succeeds
             local res, err = red:ping()
-            if res == nil then
+            if not res then
                 ok = false
-                err = "PING failed"
+                err = err or "PING failed"
             end
+        end
+        if connected then
             red:close()  -- Close connection after check
+        end
+        if unhealthy_nodes_dict:get(config_key) ~= serialized_config then
+            goto continue
         end
         -- Update health status based on check
         if ok then
             unhealthy_nodes_dict:delete(key)
+            -- Other failed nodes may still need this cluster's configuration.
+            -- It expires once checks stop using it.
             ngx.log(ngx.WARN, "health check success for: ", ip, ":", port)
         else
-            local failures = unhealthy_nodes_dict:get(key) or 0
-            unhealthy_nodes_dict:set(key, failures + 1, 60)  -- Unhealthy: increment failures with TTL
-            ngx.log(ngx.ERR, "health check failed for: ", ip, ":", port, " - failures: ", failures + 1)
+            -- Do not recreate a record removed while the probe was in flight.
+            local failures = unhealthy_nodes_dict:incr(key, 1)
+            if failures then
+                unhealthy_nodes_dict:expire(key, 60)
+                ngx.log(ngx.ERR, "health check failed for: ", ip, ":", port, " - failures: ", failures)
+            end
         end
 
         ::continue::
@@ -85,13 +160,22 @@ local function run_health_check(premature)
 end
 
 
-local function track_node_failure(ip, port, name)
+local function track_node_failure(ip, port, config)
     local unhealthy_nodes_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
     if not unhealthy_nodes_dict then
         return
     end
-    local key = generate_key(name, ip, port)
-    unhealthy_nodes_dict:incr(key, 1, 0, 60)
+    local key = generate_key(config.name, ip, port)
+    if not save_health_config(unhealthy_nodes_dict, config, false) then
+        return
+    end
+    -- Avoid evicting the configuration when allocating the failure counter.
+    local ok, err = unhealthy_nodes_dict:safe_add(key, 0, 60)
+    if not ok and err ~= "exists" then
+        ngx.log(ngx.ERR, "failed to save health check failure: ", err)
+        return
+    end
+    unhealthy_nodes_dict:incr(key, 1)
 end
 
 local function parse_key(key_str)
@@ -149,7 +233,7 @@ local function redis_slot(str)
     return redis_crc(parse_key(str))
 end
 
-local function check_auth(self, redis_client)
+check_auth = function(self, redis_client)
     if type(self.config.auth) == "string" then
         local count, err = redis_client:get_reused_times()
         if count == 0 then
@@ -221,7 +305,7 @@ local function try_hosts_slots(self, serv_list)
             end
             if err then
                 ngx.log(ngx.ERR,"unable to connect, attempt nr ", k, " : error: ", err)
-                track_node_failure(ip, port, self.config.name)
+                track_node_failure(ip, port, self.config)
                 table_insert(errors, err)
             end
         end
@@ -361,8 +445,11 @@ function _M.refresh_slots(self)
         end
         -- Cleanup stale nodes
         local all_keys = unhealthy_nodes_dict:get_keys()
+        local cluster_prefix = self.config.name .. ":"
         for _, key in ipairs(all_keys) do
-            if not current_nodes[key] then
+            if not is_config_key(key)
+                and string.sub(key, 1, #cluster_prefix) == cluster_prefix
+                and not current_nodes[key] then
                 unhealthy_nodes_dict:delete(key)
             end
         end
@@ -429,6 +516,10 @@ function _M.new(_, config)
         return nil, " redis cluster config serv_list is empty"
     end
 
+    local health_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
+    if health_dict then
+        save_health_config(health_dict, config, true)
+    end
 
     local inst = { config = config }
     inst = setmetatable(inst, mt)
@@ -577,7 +668,7 @@ local function handle_command_with_retry(self, target_ip, target_port, asking, c
                                   config.read_timeout or DEFAULT_READ_TIMEOUT)
         local ok, connerr = redis_client:connect(ip, port, self.config.connect_opts)
         if not ok then
-            track_node_failure(ip, port, self.config.name)
+            track_node_failure(ip, port, self.config)
         end
         if ok then
             local authok, autherr = check_auth(self, redis_client)
@@ -641,7 +732,7 @@ local function handle_command_with_retry(self, target_ip, target_port, asking, c
                     return nil, err
                 else
                     --There might be node fail, we should also refresh slot cache
-                    track_node_failure(ip, port, self.config.name)
+                    track_node_failure(ip, port, self.config)
                     self:refresh_slots()
                     return nil, err
                 end
