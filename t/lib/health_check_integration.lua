@@ -7,6 +7,7 @@ function _M.run(mode)
     local tls = mode ~= "plain" and mode ~= "auth" and mode ~= "wrong-auth-plain"
     local password = mode == "auth" or mode == "tls-auth"
         or mode == "wrong-auth" or mode == "wrong-auth-plain" or mode == "rotate"
+        or mode == "takeover"
     local plain_port = password and 17602 or 17600
     local tls_port = plain_port + 1
     local port = tls and tls_port or plain_port
@@ -40,29 +41,27 @@ function _M.run(mode)
 
     local listener = tls and "tls-port" or "port"
     local dict = ngx.shared.redis_cluster_health
-    local key
-    local function failure_key(excluded)
-        for _, candidate in ipairs(dict:get_keys(0)) do
-            if candidate ~= excluded and type(dict:get(candidate)) == "number"
-                and candidate:sub(-#(":127.0.0.1:" .. port)) == ":127.0.0.1:" .. port then
-                return candidate
-            end
-        end
-        error("failure counter not found")
-    end
+    local key = config.name .. ":127.0.0.1:" .. port
     assert(control:config("SET", listener, 0))
     local ok, failure = pcall(function()
+        -- A previous worker can leave a failure counter after its local state is gone.
+        if mode == "takeover" then assert(dict:set(key, 4, 60)) end
         local instance, err = cluster:new(config)
         assert(not instance and err, "connection unexpectedly succeeded with port closed")
-        key = failure_key()
-        assert((ngx.shared.redis_cluster_health:get(key) or 0) > 3,
+        assert((dict:get(key) or 0) > 3,
             "business connection failure was not recorded")
+        if mode == "takeover" then
+            assert(dict:get(key) == 4, "unhealthy node was retried by the business connection")
+        end
         if mode == "rotate" then
             config.auth = "health-test-password"
             instance, err = cluster:new(config)
             assert(not instance and err, "rotated client unexpectedly connected to closed port")
-            key = failure_key(key)
-            assert((dict:get(key) or 0) > 3, "new configuration did not record its own failure")
+            assert((dict:get(key) or 0) > 3, "configuration update removed the failure record")
+        end
+        for _, candidate in ipairs(dict:get_keys(0)) do
+            assert(type(dict:get(candidate)) == "number",
+                "health shared memory contains configuration instead of a failure counter")
         end
     end)
     -- Restore the listener even when an assertion fails.

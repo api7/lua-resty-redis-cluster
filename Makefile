@@ -21,7 +21,7 @@ test: all test-unit
 test-unit:
 	LUA_PATH="$$LUA_PATH;$(OPENRESTY_PREFIX)/lualib/?.lua;;" \
 	LUA_CPATH="$$LUA_CPATH;$(OPENRESTY_PREFIX)/lualib/?.so;;" \
-	HEALTH_CHECK_REAL_CJSON=1 $(LUAJIT) t/health_check.lua
+	$(LUAJIT) t/health_check.lua
 
 test-health:
 	PATH=$(OPENRESTY_PREFIX)/nginx/sbin:$$PATH prove -I$(TEST_NGINX_LIB) t/health-check.t

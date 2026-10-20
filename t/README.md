@@ -1,11 +1,11 @@
 # Tests
 
-Run from the repository root. Requirements: OpenResty with privileged-agent
-support, this library's Lua dependencies, Test::Nginx, Redis 6+ built with TLS,
+Run from the repository root. Requirements: OpenResty,
+this library's Lua dependencies, Test::Nginx, Redis 6+ built with TLS,
 Bash, and the OpenSSL command-line tools.
 The tests use disposable local fixtures, never a production Redis service.
-Run Nginx with permission to start a privileged agent. In Docker, use `--init`
-or a subreaper such as `tini -s` so exited daemon processes are reaped.
+In Docker, use `--init` or a subreaper such as `tini -s`
+so exited daemon processes are reaped.
 
 ## Health-check regression tests
 
@@ -22,36 +22,38 @@ Ports 17600 through 17603 must be free. Override `REDIS_SERVER`, `REDIS_CLI`,
 
 Each case closes a dedicated Redis listener through its other listener,
 causes the real cluster client's connection to fail, then reopens it.
-The privileged agent uses real Redis sockets and `ngx.shared` to check recovery.
+Worker timers use real Redis sockets and `ngx.shared` to check recovery;
+no privileged agent is started. The existing `init()` call is kept to check
+compatibility with callers that still invoke it.
 The cases cover plain TCP, TLS with server verification, password authentication,
 TLS plus authentication, rejected passwords/server names, and updated credentials
 while a node is unhealthy. The plain NOAUTH case reaches PING without sending
-AUTH, so it checks Redis's `false, error` response. These fixtures test health
-probes, not slot routing.
+AUTH, so it checks Redis's `false, error` response. Another case starts with an
+existing unhealthy counter to check that a worker can take over probing without
+another business connection failure. Each case also checks that the health
+shared dictionary stores numeric counters, not serialized connection settings.
+These fixtures test health probes, not slot routing.
 Expected connection errors are part of fault injection.
 
-## Allocation and interleaving tests
+## Worker-state and interleaving tests
 
 ```sh
 make test-unit
 ```
 
-This uses real `cjson.safe`, with Redis, shared memory, and the digest simulated
-to inject allocation failures and changes during network I/O. It covers late
-failures from older clients, endpoint/credential isolation, caller mutations,
-and expiry of unused configuration. Real digest generation is exercised by the
-OpenResty tests. It complements the real
-connection tests and does not claim to exercise OS-process concurrency.
-Set `LUA_PATH`/`LUA_CPATH` if your LuaJIT does not find OpenResty's modules.
+Redis, shared memory, and timers are simulated to exercise configuration changes
+and failure-record changes during network I/O. These tests complement the real
+connections above; simulated workers do not prove OS-process behavior.
+They also check that workers with stale credentials give waiting workers a turn,
+slow probes preserve queued turns, exited workers' wait records expire, and a
+different plugin lock dictionary does not invalidate a successful probe.
+Changing endpoints under the same cluster name is outside this fix.
 
 ## Full Test::Nginx suite
 
-`make test` runs the allocation/interleaving tests and both `t/sanity.t` and
+`make test` runs the worker-state/interleaving tests and both `t/sanity.t` and
 `t/health-check.t`. In addition to the health
 fixtures above, the existing sanity suite requires a disposable Redis Cluster
 reachable through localhost ports 7000 onward. It performs destructive commands
 such as FLUSHALL. Follow the existing suite's cluster setup before running it.
 Health fixtures are serial and must not be shared between parallel test jobs.
-
-No trial license, deployment token, private environment configuration, or captured
-cloud-host log is needed for these library regression tests.
