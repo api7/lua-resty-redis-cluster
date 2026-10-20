@@ -25,7 +25,9 @@ causes the real cluster client's connection to fail, then reopens it.
 The privileged agent uses real Redis sockets and `ngx.shared` to check recovery.
 The cases cover plain TCP, TLS with server verification, password authentication,
 TLS plus authentication, rejected passwords/server names, and updated credentials
-while a node is unhealthy. These fixtures test health probes, not slot routing.
+while a node is unhealthy. The plain NOAUTH case reaches PING without sending
+AUTH, so it checks Redis's `false, error` response. These fixtures test health
+probes, not slot routing.
 Expected connection errors are part of fault injection.
 
 ## Allocation and interleaving tests
@@ -34,8 +36,11 @@ Expected connection errors are part of fault injection.
 make test-unit
 ```
 
-This uses real `cjson.safe`, with Redis and shared memory simulated to inject
-allocation failures and changes during network I/O. It complements the real
+This uses real `cjson.safe`, with Redis, shared memory, and the digest simulated
+to inject allocation failures and changes during network I/O. It covers late
+failures from older clients, endpoint/credential isolation, caller mutations,
+and expiry of unused configuration. Real digest generation is exercised by the
+OpenResty tests. It complements the real
 connection tests and does not claim to exercise OS-process concurrency.
 Set `LUA_PATH`/`LUA_CPATH` if your LuaJIT does not find OpenResty's modules.
 

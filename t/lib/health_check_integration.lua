@@ -29,23 +29,40 @@ function _M.run(mode)
             pool = "health-test-" .. mode,
         },
     }
-    if mode == "wrong-auth" or mode == "wrong-auth-plain" or mode == "rotate" then
+    if mode == "wrong-auth" or mode == "rotate" then
         config.auth = "old-or-wrong-password"
+    elseif mode == "wrong-auth-plain" then
+        -- Reach PING and get Redis's false, NOAUTH response; do not fail AUTH first.
+        config.auth = nil
     elseif mode == "wrong-name" then
         config.connect_opts.server_name = "wrong.invalid"
     end
 
     local listener = tls and "tls-port" or "port"
+    local dict = ngx.shared.redis_cluster_health
+    local key
+    local function failure_key(excluded)
+        for _, candidate in ipairs(dict:get_keys(0)) do
+            if candidate ~= excluded and type(dict:get(candidate)) == "number"
+                and candidate:sub(-#(":127.0.0.1:" .. port)) == ":127.0.0.1:" .. port then
+                return candidate
+            end
+        end
+        error("failure counter not found")
+    end
     assert(control:config("SET", listener, 0))
     local ok, failure = pcall(function()
-        local instance = cluster:new(config)
-        assert(not instance, "connection unexpectedly succeeded with port closed")
-        local key = "health-test:127.0.0.1:" .. port
+        local instance, err = cluster:new(config)
+        assert(not instance and err, "connection unexpectedly succeeded with port closed")
+        key = failure_key()
         assert((ngx.shared.redis_cluster_health:get(key) or 0) > 3,
             "business connection failure was not recorded")
         if mode == "rotate" then
             config.auth = "health-test-password"
-            cluster:new(config)
+            instance, err = cluster:new(config)
+            assert(not instance and err, "rotated client unexpectedly connected to closed port")
+            key = failure_key(key)
+            assert((dict:get(key) or 0) > 3, "new configuration did not record its own failure")
         end
     end)
     -- Restore the listener even when an assertion fails.
@@ -53,26 +70,18 @@ function _M.run(mode)
     control:close()
     assert(ok, failure)
 
-    local key = "health-test:127.0.0.1:" .. port
-    if mode == "wrong-auth" or mode == "wrong-auth-plain" or mode == "wrong-name" then
-        local before = ngx.shared.redis_cluster_health:get(key)
-        local deadline = ngx.now() + 4
-        repeat
-            ngx.sleep(0.05)
-        until (ngx.shared.redis_cluster_health:get(key) or 0) > before
-            or ngx.now() >= deadline
-        assert((ngx.shared.redis_cluster_health:get(key) or 0) > before,
-            "invalid credentials or certificate name incorrectly recovered")
-        ngx.say("rejected")
-        return
-    end
-
+    local rejected = mode == "wrong-auth" or mode == "wrong-auth-plain" or mode == "wrong-name"
+    local before = dict:get(key)
     local deadline = ngx.now() + 4
+    local complete
     repeat
         ngx.sleep(0.05)
-    until not ngx.shared.redis_cluster_health:get(key) or ngx.now() >= deadline
-    assert(not ngx.shared.redis_cluster_health:get(key), "node did not recover")
-    ngx.say("recovered")
+        local failures = dict:get(key)
+        complete = rejected and (failures or 0) > before or not rejected and not failures
+    until complete or ngx.now() >= deadline
+    assert(complete, rejected and "invalid credentials or certificate name incorrectly recovered"
+        or "node did not recover")
+    ngx.say(rejected and "rejected" or "recovered")
 end
 
 return _M

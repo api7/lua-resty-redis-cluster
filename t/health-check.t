@@ -90,7 +90,7 @@ GET /t
 rejected
 --- timeout: 8
 
-=== TEST 7: new client updates credentials while node is unhealthy
+=== TEST 7: rotated credentials recover independently of the old configuration
 --- http_config eval: $::HttpConfig
 --- config
     location /t { content_by_lua_block { require("health_check_integration").run("rotate") } }

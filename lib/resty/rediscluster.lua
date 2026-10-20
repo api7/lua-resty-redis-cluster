@@ -2,6 +2,8 @@ local redis = require "resty.redis"
 local cjson = require "cjson.safe"
 local resty_lock = require "resty.lock"
 local xmodem = require "resty.xmodem"
+local sha256 = require "resty.sha256"
+local to_hex = require("resty.string").to_hex
 local setmetatable = setmetatable
 local tostring = tostring
 local string = string
@@ -33,54 +35,23 @@ local DEFAULT_HEALTH_DICT_NAME = "redis_cluster_health"
 local err_unhealthy_master = "master node is unhealthy"
 local health_check_running = false
 local check_auth
-local HEALTH_CONFIG_PREFIX = "config:"
 local function generate_key(name, ip, port)
     return name .. ":" .. ip .. ":" .. port
 end
 
 
-local function generate_config_key(name)
-    return HEALTH_CONFIG_PREFIX .. name
-end
-
-
-local function is_config_key(key)
-    return string.sub(key, 1, #HEALTH_CONFIG_PREFIX) == HEALTH_CONFIG_PREFIX
-        and not string.match(key, "^[^:]+:[^:]+:%d+$")
-end
-
-
-local function save_health_config(dict, config, update_existing)
-    local key = generate_config_key(config.name)
-    local current = dict:get(key)
-    -- Publish credentials only for clusters with failures. New clients update
-    -- an existing snapshot; an older in-flight failure must not overwrite it.
-    if update_existing and not current or not update_existing and current then
-        return true
+-- Encode object entries in a stable order so workers agree on the identity.
+local function ordered(value)
+    if type(value) ~= "table" then return value end
+    local keys, entries = {}, {}
+    for key in pairs(value) do keys[#keys + 1] = key end
+    table.sort(keys, function(a, b)
+        return type(a) .. tostring(a) < type(b) .. tostring(b)
+    end)
+    for _, key in ipairs(keys) do
+        entries[#entries + 1] = {key, ordered(value[key])}
     end
-
-    local serialized, err = cjson.encode({
-        connect_opts = config.connect_opts,
-        auth = config.auth,
-    })
-    if serialized == current and serialized then
-        return true
-    end
-    local ok
-    if serialized then
-        if update_existing then
-            ok, err = dict:safe_set(key, serialized, 60)
-        else
-            ok, err = dict:safe_add(key, serialized, 60)
-            if err == "exists" then return true end
-        end
-    end
-    if not ok then
-        if update_existing then dict:delete(key) end
-        ngx.log(ngx.ERR, "failed to save health check config: ", err)
-        return nil
-    end
-    return true
+    return entries
 end
 
 
@@ -96,7 +67,7 @@ local function run_health_check(premature)
 
     local all_keys = unhealthy_nodes_dict:get_keys(0)
     for _, key in ipairs(all_keys) do
-        if is_config_key(key) then
+        if type(unhealthy_nodes_dict:get(key)) ~= "number" then
             goto continue
         end
         local name, ip, port = string.match(key, "^([^:]+):([^:]+):(%d+)$")
@@ -104,8 +75,7 @@ local function run_health_check(premature)
             unhealthy_nodes_dict:delete(key)
             goto continue
         end
-        local config_key = generate_config_key(name)
-        local serialized_config = unhealthy_nodes_dict:get(config_key)
+        local serialized_config = unhealthy_nodes_dict:get(name)
         local config = serialized_config and cjson.decode(serialized_config)
         if type(config) ~= "table" then
             -- Without configuration the agent cannot probe this node. Allow
@@ -113,8 +83,6 @@ local function run_health_check(premature)
             unhealthy_nodes_dict:delete(key)
             goto continue
         end
-        -- Renew in place: never write an old snapshot back after network I/O.
-        unhealthy_nodes_dict:expire(config_key, 60)
         port = tonumber(port)
         -- Create a new Redis client for each check
         local red = redis:new()
@@ -137,14 +105,14 @@ local function run_health_check(premature)
         if connected then
             red:close()  -- Close connection after check
         end
-        if unhealthy_nodes_dict:get(config_key) ~= serialized_config then
+        if unhealthy_nodes_dict:get(name) ~= serialized_config then
             goto continue
         end
         -- Update health status based on check
         if ok then
             unhealthy_nodes_dict:delete(key)
             -- Other failed nodes may still need this cluster's configuration.
-            -- It expires once checks stop using it.
+            -- It expires once clients stop using this configuration.
             ngx.log(ngx.WARN, "health check success for: ", ip, ":", port)
         else
             -- Do not recreate a record removed while the probe was in flight.
@@ -160,14 +128,20 @@ local function run_health_check(premature)
 end
 
 
-local function track_node_failure(ip, port, config)
+local function track_node_failure(ip, port, self)
     local unhealthy_nodes_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
     if not unhealthy_nodes_dict then
         return
     end
-    local key = generate_key(config.name, ip, port)
-    if not save_health_config(unhealthy_nodes_dict, config, false) then
-        return
+    local key = generate_key(self.cache_key, ip, port)
+    local config_key = self.cache_key
+    -- Only clients renew snapshots; probes must let abandoned credentials expire.
+    if not unhealthy_nodes_dict:expire(config_key, 60) then
+        local ok, err = unhealthy_nodes_dict:safe_add(config_key, self.health_config, 60)
+        if not ok and err ~= "exists" then
+            ngx.log(ngx.ERR, "failed to save health check config: ", err)
+            return
+        end
     end
     -- Avoid evicting the configuration when allocating the failure counter.
     local ok, err = unhealthy_nodes_dict:safe_add(key, 0, 60)
@@ -194,8 +168,10 @@ local _M = {}
 
 local mt = { __index = _M }
 
-local slot_cache = {}
-local master_nodes = {}
+-- Keep the current topology for each name between requests. Older versions
+-- survive only while a client still uses them, so rotations do not leak caches.
+local cluster_cache = setmetatable({}, { __mode = "v" })
+local latest_cache = {}
 
 
 local function health_check(premature)
@@ -278,7 +254,7 @@ local function try_hosts_slots(self, serv_list)
     for i = 1, #serv_list do
         local ip = serv_list[i].ip
         local port = serv_list[i].port
-        local is_healthy = is_node_healthy(ip, port, self.config.name)
+        local is_healthy = is_node_healthy(ip, port, self.cache_key)
         if not is_healthy then
             goto continue
         end
@@ -305,7 +281,7 @@ local function try_hosts_slots(self, serv_list)
             end
             if err then
                 ngx.log(ngx.ERR,"unable to connect, attempt nr ", k, " : error: ", err)
-                track_node_failure(ip, port, self.config)
+                track_node_failure(ip, port, self)
                 table_insert(errors, err)
             end
         end
@@ -342,14 +318,15 @@ local function try_hosts_slots(self, serv_list)
                     end
                 end
                 --ngx.log(ngx.NOTICE, "finished initializing slotcache...")
-                slot_cache[self.config.name] = slots
-                slot_cache[self.config.name .. "serv_list"] = servers
+                self.cache.slots = slots
+                self.cache.servers = servers
             else
                 table_insert(errors, err)
             end
             -- cache master nodes
             local nodes_res, nerr = redis_client:cluster("nodes")
             if nodes_res then
+                self.cache.masters = {}
                 local nodes_info = split(nodes_res, char(10))
                 for _, node in ipairs(nodes_info) do
                     local node_info = split(node, " ")
@@ -357,7 +334,7 @@ local function try_hosts_slots(self, serv_list)
                         local is_master = match(node_info[3], "master") ~= nil
                         if is_master then
                             local ip_port = split(split(node_info[2], "@")[1], ":")
-                            table_insert(master_nodes, {
+                            table_insert(self.cache.masters, {
                                 ip = ip_port[1],
                                 port = tonumber(ip_port[2])
                             })
@@ -390,7 +367,7 @@ end
 
 function _M.fetch_slots(self)
     local serv_list = self.config.serv_list
-    local serv_list_cached = slot_cache[self.config.name .. "serv_list"]
+    local serv_list_cached = self.cache.servers
 
     local serv_list_combined
 
@@ -438,17 +415,16 @@ function _M.refresh_slots(self)
     local unhealthy_nodes_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
     if unhealthy_nodes_dict then
         local current_nodes = {}
-        local servers = slot_cache[self.config.name .. "serv_list"].serv_list
+        local servers = self.cache.servers.serv_list
         for _, node in ipairs(servers) do
-            local key = generate_key(self.config.name, node.ip, node.port)
+            local key = generate_key(self.cache_key, node.ip, node.port)
             current_nodes[key] = true
         end
         -- Cleanup stale nodes
         local all_keys = unhealthy_nodes_dict:get_keys()
-        local cluster_prefix = self.config.name .. ":"
+        local cluster_prefix = self.cache_key .. ":"
         for _, key in ipairs(all_keys) do
-            if not is_config_key(key)
-                and string.sub(key, 1, #cluster_prefix) == cluster_prefix
+            if string.sub(key, 1, #cluster_prefix) == cluster_prefix
                 and not current_nodes[key] then
                 unhealthy_nodes_dict:delete(key)
             end
@@ -464,7 +440,7 @@ end
 
 
 function _M.init_slots(self)
-    if slot_cache[self.config.name] then
+    if self.cache.slots then
         -- already initialized
         return true
     end
@@ -475,13 +451,13 @@ function _M.init_slots(self)
         return nil, err
     end
 
-    elapsed, err = lock:lock("redis_cluster_slot_" .. self.config.name)
+    elapsed, err = lock:lock("redis_cluster_slot_" .. self.cache_key)
     if not elapsed then
         ngx.log(ngx.ERR, "failed to acquire the lock in initialization slot cache: ", err)
         return nil, err
     end
 
-    if slot_cache[self.config.name] then
+    if self.cache.slots then
         ok, err = lock:unlock()
         if not ok then
             ngx.log(ngx.ERR, "failed to unlock in initialization slot cache: ", err)
@@ -516,12 +492,28 @@ function _M.new(_, config)
         return nil, " redis cluster config serv_list is empty"
     end
 
+    local serialized, err = cjson.encode({
+        serv_list = config.serv_list, connect_opts = config.connect_opts, auth = config.auth,
+    })
+    if not serialized then return nil, "invalid Redis connection configuration: " .. err end
+    local snapshot = cjson.decode(serialized)
+    local digest = sha256:new()
+    digest:update(cjson.encode(ordered(snapshot)))
+    local identity = to_hex(digest:final())
+    -- Capture connection settings: later caller mutations must not change the
+    -- credentials associated with an already-created client's identity.
+    for key, value in pairs(config) do
+        if snapshot[key] == nil then snapshot[key] = value end
+    end
+    local inst = { config = snapshot, cache_key = config.name .. "@" .. identity,
+                   health_config = serialized }
+    inst.cache = cluster_cache[inst.cache_key] or {}
+    cluster_cache[inst.cache_key] = inst.cache
+    latest_cache[config.name] = inst.cache
     local health_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
     if health_dict then
-        save_health_config(health_dict, config, true)
+        health_dict:expire(inst.cache_key, 60)
     end
-
-    local inst = { config = config }
     inst = setmetatable(inst, mt)
     local _, err = inst:init_slots()
     if err then
@@ -535,7 +527,7 @@ local function pick_node(self, serv_list, slot, magic_radom_seed)
     local healthy_servers = {}
     for i, node in ipairs(serv_list) do
         -- first node here is master. If its unhealthy then we should return err
-        local is_healthy = is_node_healthy(node.ip, node.port, self.config.name)
+        local is_healthy = is_node_healthy(node.ip, node.port, self.cache_key)
         if i == 1 and not is_healthy then
             return nil, nil, nil, err_unhealthy_master
         end
@@ -636,7 +628,7 @@ local function handle_command_with_retry(self, target_ip, target_port, asking, c
             ngx.log(ngx.WARN, "handle retry attempts:" .. k .. " for cmd:" .. cmd .. " key:" .. key)
         end
 
-        local slots = slot_cache[self.config.name]
+        local slots = self.cache.slots
         if slots == nil or slots[slot] == nil then
             return nil, "not slots information present, nginx might have never successfully executed cluster(\"slots\")"
         end
@@ -668,7 +660,7 @@ local function handle_command_with_retry(self, target_ip, target_port, asking, c
                                   config.read_timeout or DEFAULT_READ_TIMEOUT)
         local ok, connerr = redis_client:connect(ip, port, self.config.connect_opts)
         if not ok then
-            track_node_failure(ip, port, self.config)
+            track_node_failure(ip, port, self)
         end
         if ok then
             local authok, autherr = check_auth(self, redis_client)
@@ -732,7 +724,7 @@ local function handle_command_with_retry(self, target_ip, target_port, asking, c
                     return nil, err
                 else
                     --There might be node fail, we should also refresh slot cache
-                    track_node_failure(ip, port, self.config)
+                    track_node_failure(ip, port, self)
                     self:refresh_slots()
                     return nil, err
                 end
@@ -759,13 +751,13 @@ local function generate_magic_seed(self)
     --alway want pick up specific 3 nodes for pipeline requests, instead of 9.
     --Currently we simply use (num of allnode)%count as a randomly fetch. Might consider a better way in the future.
     -- use the dynamic serv_list instead of the static config serv_list
-    local nodeCount = #slot_cache[self.config.name .. "serv_list"].serv_list
+    local nodeCount = #self.cache.servers.serv_list
     return math.random(nodeCount)
 end
 
 local function _do_cmd_master(self, cmd, key, ...)
     local errors = {}
-    for _, master in ipairs(master_nodes) do
+    for _, master in ipairs(self.cache.masters or {}) do
         local redis_client = redis:new()
         redis_client:set_timeouts(self.config.connect_timeout or DEFAULT_CONNECTION_TIMEOUT,
                                   self.config.send_timeout or DEFAULT_SEND_TIMEOUT,
@@ -872,7 +864,7 @@ function _M.commit_pipeline(self)
     self._reqs = nil
     local config = self.config
 
-    local slots = slot_cache[config.name]
+    local slots = self.cache.slots
     if slots == nil then
         return nil, "not slots information present, nginx might have never successfully executed cluster(\"slots\")"
     end
