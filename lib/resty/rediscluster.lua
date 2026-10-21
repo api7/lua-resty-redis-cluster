@@ -190,8 +190,11 @@ health_check = function(premature)
         return
     end
     health_check_running = true
-    pcall(run_health_check)
+    local ok, err = pcall(run_health_check)
     health_check_running = false
+    if not ok then
+        ngx.log(ngx.ERR, "Redis health check failed: ", err)
+    end
 end
 
 local function is_node_healthy(ip, port, name)

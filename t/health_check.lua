@@ -342,6 +342,23 @@ test("a full lock dictionary skips the probe without clearing the failure", func
     assert(#connects == before and health:get(key) == 4)
 end)
 
+test("probe exceptions are logged without blocking later checks", function()
+    local w, message = worker()
+    fail(w)
+    ngx.log = function(level, ...)
+        if level == ngx.ERR then message = table.concat({...}) end
+    end
+    hook = function() error("injected probe failure", 0) end
+    w.tick(false)
+    assert(message and message:find("injected probe failure", 1, true), "probe error was not logged")
+    assert(health:get(key) == 4, "exception changed the failure record")
+    message = nil
+    now, down = now + 6, false
+    w.tick(false)
+    assert(not health:get(key), "exception blocked a later health check")
+    assert(not message, "successful probe logged an exception")
+end)
+
 test("same-name clients retain the original topology cache", function()
     local w = worker(true)
     down, password = false, "old"
