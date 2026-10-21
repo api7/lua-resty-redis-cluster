@@ -31,67 +31,127 @@ local DEFAULT_READ_TIMEOUT = 1000
 local DEFAULT_HEALTH_DICT_NAME = "redis_cluster_health"
 local err_unhealthy_master = "master node is unhealthy"
 local health_check_running = false
+local health_timer_started = false
+local health_configs, pending_nodes = {}, {}
+local check_auth, health_check
 local function generate_key(name, ip, port)
     return name .. ":" .. ip .. ":" .. port
 end
 
 
-local function run_health_check(premature)
-    if premature then
-        return
+-- Compare values, since callers can create equivalent option tables per request.
+local function same_config(a, b)
+    if a.auth ~= b.auth then
+        return false
     end
-
-    local unhealthy_nodes_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
-    if not unhealthy_nodes_dict then
-        return
+    local x, y = a.connect_opts or {}, b.connect_opts or {}
+    for key, value in pairs(x) do
+        if y[key] ~= value then return false end
     end
+    for key, value in pairs(y) do
+        if x[key] ~= value then return false end
+    end
+    return true
+end
 
-    local all_keys = unhealthy_nodes_dict:get_keys()
-    for _, key in ipairs(all_keys) do
-        local ip, port = string.match(key, "^[^:]+:([^:]+):(%d+)$")
-        if not ip or not port then
-            unhealthy_nodes_dict:delete(key)
+
+local function lock_probe(locks, key)
+    local id, prefix = ngx.worker.id(), key .. ":wait:"
+    local wait_key = prefix .. id
+    -- Keep our place between ticks so a failing worker cannot keep jumping ahead.
+    locks:safe_add(wait_key, ngx.now(), 5)
+    local ticket = locks:get(wait_key)
+    if not ticket then return end
+    locks:expire(wait_key, 5)
+    for other_id = 0, ngx.worker.count() - 1 do
+        local other = locks:get(prefix .. other_id)
+        if other and (other < ticket or other == ticket and other_id < id) then
+            return
+        end
+    end
+    local lease = ngx.now()
+    if locks:safe_add(key, lease, 5) then
+        locks:delete(wait_key)
+        return lease
+    end
+end
+
+
+local function run_health_check()
+    local dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
+    for key, node in pairs(pending_nodes) do
+        local failures = dict:get(key)
+        if not failures then
+            pending_nodes[key] = nil
             goto continue
         end
-        port = tonumber(port)
-        local ok
-        -- Create a new Redis client for each check
-        local red = redis:new()
-        red:set_timeouts(500, 500, 500)  -- 500ms for connect/send/read
-        ngx.log(ngx.WARN, "health check for: ", ip, ":", port)
-        -- Attempt to connect and send PING
-        local ok, err = red:connect(ip, port)
-        if ok then
-            -- Check if PING succeeds
-            local res, err = red:ping()
-            if res == nil then
-                ok = false
-                err = "PING failed"
-            end
-            red:close()  -- Close connection after check
-        end
-        -- Update health status based on check
-        if ok then
-            unhealthy_nodes_dict:delete(key)
-            ngx.log(ngx.WARN, "health check success for: ", ip, ":", port)
-        else
-            local failures = unhealthy_nodes_dict:get(key) or 0
-            unhealthy_nodes_dict:set(key, failures + 1, 60)  -- Unhealthy: increment failures with TTL
-            ngx.log(ngx.ERR, "health check failed for: ", ip, ":", port, " - failures: ", failures + 1)
+        local config = health_configs[node.name]
+        -- Use the existing lock dictionary; slot cleanup only touches health records.
+        local locks = ngx.shared[config.dict_name or DEFAULT_SHARED_DICT_NAME]
+        local lock_key = "redis_cluster_probe_" .. key
+        local lease = locks and lock_probe(locks, lock_key)
+        if not lease then
+            goto continue
         end
 
+        local red = redis:new()
+        red:set_timeouts(500, 500, 500)
+        ngx.log(ngx.WARN, "health check for: ", node.ip, ":", node.port)
+        local ok, err = red:connect(node.ip, node.port, config.connect_opts)
+        if ok then
+            ok, err = check_auth({config = config}, red)
+            if ok then
+                ok, err = red:ping()
+            end
+            red:close()
+        end
+
+        -- An expired probe must not change its successor's lock or result.
+        if locks:get(lock_key) ~= lease then
+            goto continue
+        end
+        locks:expire(lock_key, math.max(0.001, lease + 1 - ngx.now()))
+        if not same_config(config, health_configs[node.name])
+            or dict:get(key) ~= failures then
+            goto continue
+        end
+        if ok then
+            dict:delete(key)
+            pending_nodes[key] = nil
+            ngx.log(ngx.WARN, "health check success for: ", node.ip, ":", node.port)
+        else
+            local failures = dict:incr(key, 1)
+            if failures then
+                dict:expire(key, 60)
+                ngx.log(ngx.ERR, "health check failed for: ", node.ip, ":", node.port,
+                        " - failures: ", failures)
+            end
+        end
         ::continue::
     end
 end
 
 
+local function watch_node(ip, port, name)
+    pending_nodes[generate_key(name, ip, port)] = {name = name, ip = ip, port = port}
+    if not health_timer_started then
+        local ok, err = ngx.timer.every(1, health_check)
+        health_timer_started = ok
+        if not ok then
+            ngx.log(ngx.ERR, "failed to start Redis health timer: ", err)
+        end
+    end
+end
+
+
 local function track_node_failure(ip, port, name)
-    local unhealthy_nodes_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
-    if not unhealthy_nodes_dict then
+    local dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
+    if not dict then
         return
     end
-    local key = generate_key(name, ip, port)
-    unhealthy_nodes_dict:incr(key, 1, 0, 60)
+    if dict:incr(generate_key(name, ip, port), 1, 0, 60) then
+        watch_node(ip, port, name)
+    end
 end
 
 local function parse_key(key_str)
@@ -114,13 +174,27 @@ local slot_cache = {}
 local master_nodes = {}
 
 
-local function health_check(premature)
+health_check = function(premature)
+    if premature then
+        return
+    end
     if health_check_running then
+        -- Keep queued turns while this worker is probing other slow nodes.
+        for key, node in pairs(pending_nodes) do
+            local config = health_configs[node.name]
+            local locks = ngx.shared[config.dict_name or DEFAULT_SHARED_DICT_NAME]
+            if locks then
+                locks:expire("redis_cluster_probe_" .. key .. ":wait:" .. ngx.worker.id(), 5)
+            end
+        end
         return
     end
     health_check_running = true
-    pcall(run_health_check, premature)
+    local ok, err = pcall(run_health_check)
     health_check_running = false
+    if not ok then
+        ngx.log(ngx.ERR, "Redis health check failed: ", err)
+    end
 end
 
 local function is_node_healthy(ip, port, name)
@@ -130,8 +204,12 @@ local function is_node_healthy(ip, port, name)
     end
 
     local key = generate_key(name, ip, port)
-    local is_healthy = (unhealthy_nodes_dict:get(key) or 0) <= 3
-    return is_healthy
+    local failures = unhealthy_nodes_dict:get(key)
+    if failures then
+        -- A replacement worker can adopt failures recorded by another worker.
+        watch_node(ip, port, name)
+    end
+    return (failures or 0) <= 3
 end
 
 
@@ -149,7 +227,7 @@ local function redis_slot(str)
     return redis_crc(parse_key(str))
 end
 
-local function check_auth(self, redis_client)
+check_auth = function(self, redis_client)
     if type(self.config.auth) == "string" then
         local count, err = redis_client:get_reused_times()
         if count == 0 then
@@ -430,6 +508,15 @@ function _M.new(_, config)
     end
 
 
+    -- Keep credentials local and preserve non-JSON connection options.
+    local opts
+    if config.connect_opts then
+        opts = {}
+        for key, value in pairs(config.connect_opts) do opts[key] = value end
+    end
+    health_configs[config.name] = {
+        auth = config.auth, connect_opts = opts, dict_name = config.dict_name,
+    }
     local inst = { config = config }
     inst = setmetatable(inst, mt)
     local _, err = inst:init_slots()
@@ -933,7 +1020,7 @@ setmetatable(_M, {
 })
 
 function _M.init()
-    ngx.timer.every(1, health_check)
+    -- Compatibility entry point; workers start their timers on demand.
 end
 
 return _M
