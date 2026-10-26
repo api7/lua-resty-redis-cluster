@@ -175,6 +175,15 @@ test("latest registration wins over a late failure from an older client", functi
     assert(auths[1] == "new" and not health:get(key))
 end)
 
+test("in-place credential updates are used by the next probe", function()
+    local w = worker()
+    local client = fail(w, "old")
+    client.config.auth = "new"
+    down, password = false, "new"
+    w.tick(false)
+    assert(auths[1] == "new" and not health:get(key), "updated credentials did not recover")
+end)
+
 test("a failed in-flight probe retries with the latest credentials", function()
     local w = worker()
     fail(w, "old")

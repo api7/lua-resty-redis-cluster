@@ -488,9 +488,7 @@ function _M.new(_, config)
 
 
     -- Keep credentials local and preserve non-JSON connection options.
-    health_configs[config.name] = {
-        auth = config.auth, connect_opts = config.connect_opts, dict_name = config.dict_name,
-    }
+    health_configs[config.name] = config
     local inst = { config = config }
     inst = setmetatable(inst, mt)
     local _, err = inst:init_slots()
