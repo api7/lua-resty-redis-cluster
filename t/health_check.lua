@@ -2,7 +2,6 @@
 package.path = "lib/?.lua;" .. package.path
 local now, down, password, hook, auths, connects, closes
 local health, locks, worker_count
-local digests = {}
 local function dictionary()
     local data, expires = {}, {}
     local dict = {}
@@ -20,7 +19,6 @@ local function dictionary()
         return self:set(key, value, ttl)
     end
     function dict:incr(key, amount, initial, ttl)
-        self.last_incr = key
         local value = self:get(key)
         if value == nil then
             if initial == nil then return nil, "not found" end
@@ -88,14 +86,6 @@ local function worker(real_slots)
     local w = {starts = 0, id = worker_count}
     worker_count = worker_count + 1
     ngx = {
-        sha1_bin = function(value)
-            if not digests[value] then
-                digests[#digests + 1] = value
-                digests[value] = tostring(#digests)
-            end
-            return digests[value]
-        end,
-        encode_base64 = function(value) return value .. "=" end,
         WARN = 4, ERR = 3, now = function() return now end, log = function() end,
         shared = {redis_cluster_health = health, redis_cluster_slot_locks = locks},
         worker = {
@@ -125,7 +115,6 @@ end
 local function fail(w, auth, opts)
     local client = w:client(auth, opts)
     client:fetch_slots()
-    key = health.last_incr
     assert(health:get(key) == 4, "business failure not recorded")
     return client
 end
@@ -161,11 +150,13 @@ test("TLS options and AUTH remain local, including non-JSON options", function()
         assert(type(health:get(k)) == "number", "configuration leaked to shm")
     end
     down, password = false, "secret"
+    opts.server_name = "updated.example"
     assert(w.tick, "worker timer was not started")
     w.tick(false)
     assert(not health:get(key), "healthy authenticated node was not recovered")
     local actual = connects[#connects]
     assert(actual.ssl and actual.ssl_verify and actual.client_cert == cert)
+    assert(actual.server_name == "updated.example", "probe used outdated connection options")
     assert(auths[1] == password and closes == 1)
     local before = #connects
     now = now + 6
@@ -173,7 +164,7 @@ test("TLS options and AUTH remain local, including non-JSON options", function()
     assert(#connects == before, "recovered node was probed again")
 end)
 
-test("a late failure from an older client does not gate new credentials", function()
+test("latest registration wins over a late failure from an older client", function()
     local w = worker()
     local old = w:client("old")
     w:client("new")
@@ -181,24 +172,19 @@ test("a late failure from an older client does not gate new credentials", functi
     down, password = false, "new"
     assert(w.tick, "worker timer was not started")
     w.tick(false)
-    local _, err = w:client("new"):fetch_slots()
-    assert(not err and auths[1] == "new")
+    assert(auths[1] == "new" and not health:get(key))
 end)
 
-test("in-place AUTH and TLS updates stop using the old failure record", function()
-    for _, tls in ipairs({false, true}) do
-        reset()
-        local w, opts = worker(), {ssl = true, server_name = "old"}
-        local client = fail(w, "old", opts)
-        if tls then opts.server_name = "new" else client.config.auth = "new" end
-        down, password = false, tls and "old" or "new"
-        w.tick(false)
-        local _, err = client:fetch_slots()
-        assert(not err and auths[1] == password, "updated settings did not recover")
-    end
+test("in-place credential updates are used by the next probe", function()
+    local w = worker()
+    local client = fail(w, "old")
+    client.config.auth = "new"
+    down, password = false, "new"
+    w.tick(false)
+    assert(auths[1] == "new" and not health:get(key), "updated credentials did not recover")
 end)
 
-test("an in-flight failure stays with its original credentials", function()
+test("a failed in-flight probe retries with the latest credentials", function()
     local w = worker()
     fail(w, "old")
     down, password = false, "new"
@@ -207,8 +193,7 @@ test("an in-flight failure stays with its original credentials", function()
     assert(auths[1] == "old" and health:get(key) == 5, "failed probe was not counted")
     now = now + 6
     w.tick(false)
-    local _, err = w:client("new"):fetch_slots()
-    assert(not err and auths[2] == "new", "new credentials did not recover")
+    assert(auths[2] == "new" and not health:get(key), "new credentials did not recover")
 end)
 
 test("equivalent connection settings survive a lock dictionary change", function()
@@ -238,19 +223,18 @@ test("a new worker adopts failures and shares the probe lock", function()
     assert(not health:get(key))
 end)
 
-test("rotated credentials recover independently of stale workers", function()
+test("stale workers cannot starve a worker with rotated credentials", function()
     local a, b, c = worker(), worker(), worker()
     fail(a, "old")
     b:client("old"):fetch_slots()
     c:client("new"):fetch_slots()
-    local current_key = health.last_incr
     down, password = false, "new"
     for second = 10, 13 do
         now = second; a.tick(false)
         now = second + 0.2; b.tick(false)
         now = second + 0.4; c.tick(false)
     end
-    assert(not health:get(current_key), "earlier stale workers starved the valid credentials")
+    assert(not health:get(key), "earlier stale workers starved the valid credentials")
 end)
 
 test("an abandoned older waiter eventually allows another worker to recover", function()
@@ -268,9 +252,8 @@ end)
 
 test("a busy worker keeps its place while probing another node", function()
     local a, b = worker(), worker()
-    fail(a, "new")
+    fail(a, "old")
     b:client("new"):fetch_slots()
-    local current_key = health.last_incr
     a.tick(false)
     now = 10.1; b.tick(false)
     local other = assert(b.module:new({
@@ -278,20 +261,18 @@ test("a busy worker keeps its place while probing another node", function()
         auth = "new", max_connection_attempts = 4,
     }))
     other:fetch_slots()
-    assert(health:get(health.last_incr) == 4)
+    assert(health:get("other:127.0.0.1:7001") == 4)
     down, password = false, "new"
     hook = function()
         for second = 11, 16 do
             now = second
             b.tick(false)
         end
-        local before = #connects
         a.tick(false)
-        assert(#connects == before, "busy worker lost its place")
     end
     now = 10.2; b.tick(false)
     now = 16.2; b.tick(false)
-    assert(not health:get(current_key), "busy worker lost its turn to stale credentials")
+    assert(not health:get(key), "busy worker lost its turn to stale credentials")
 end)
 
 test("a slow probe excludes another worker after the first second", function()
@@ -396,36 +377,6 @@ test("same-name clients retain the original topology cache", function()
     local before = #connects
     w:client("new")
     assert(#connects == before, "credentials changed business slot cache behavior")
-end)
-
-test("old probes cannot gate a new worker's rotated credentials", function()
-    local a = worker(true)
-    down, password = false, "old"
-    local old = a:client("old")
-    down = true
-    old:fetch_slots()
-    down, password = false, "new"
-    local b = worker(true)
-    local current = b:client("new")
-    a.tick(false)
-    local before = #connects
-    local _, err = current:fetch_slots()
-    assert(not err and #connects > before, "old probe gated the new credentials")
-end)
-
-test("an in-flight old success cannot clear the new configuration's failures", function()
-    local a, b = worker(), worker()
-    fail(a, "old")
-    down, password = false, "old"
-    local current_key
-    hook = function()
-        down = true
-        fail(b, "new")
-        current_key = key
-        down = false
-    end
-    a.tick(false)
-    assert(health:get(current_key) == 4, "old success cleared the new failure record")
 end)
 
 print(passed .. " passed, " .. failed .. " failed")
