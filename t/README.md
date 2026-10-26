@@ -57,3 +57,13 @@ fixtures above, the existing sanity suite requires a disposable Redis Cluster
 reachable through localhost ports 7000 onward. It performs destructive commands
 such as FLUSHALL. Follow the existing suite's cluster setup before running it.
 Health fixtures are serial and must not be shared between parallel test jobs.
+
+## Continuous integration
+
+The Test workflow runs `bash t/run-ci.sh` on pull requests to `devel` and pushes
+to `devel`. It installs OpenResty, Test::Nginx, LuaCov, and TLS-capable Redis,
+then runs the existing `make test` target. The runner script creates a disposable
+six-node cluster on ports 7000 through 7005 and reuses the health fixtures above.
+It stops its Redis processes on exit and refuses occupied cluster ports.
+Run the same script locally once the dependencies are installed. Failed workflow
+runs retain the test output and available Redis/nginx logs as the `test-logs` artifact.
