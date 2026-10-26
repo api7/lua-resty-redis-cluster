@@ -41,7 +41,17 @@ function _M.run(mode)
 
     local listener = tls and "tls-port" or "port"
     local dict = ngx.shared.redis_cluster_health
-    local key = config.name .. ":127.0.0.1:" .. port
+    local function failure_key()
+        local opts = config.connect_opts
+        local settings = string.format("%q:%q:%q:%q:%q",
+            type(config.auth) .. ":" .. tostring(config.auth),
+            tostring(not not opts.ssl), tostring(not not opts.ssl_verify),
+            type(opts.server_name) .. ":" .. tostring(opts.server_name),
+            type(opts.pool) .. ":" .. tostring(opts.pool))
+        return config.name .. ":127.0.0.1:" .. port .. ":config:"
+               .. ngx.encode_base64(ngx.sha1_bin(settings))
+    end
+    local key = failure_key()
     assert(control:config("SET", listener, 0))
     local ok, failure = pcall(function()
         -- A previous worker can leave a failure counter after its local state is gone.
@@ -55,9 +65,10 @@ function _M.run(mode)
         end
         if mode == "rotate" then
             config.auth = "health-test-password"
+            key = failure_key()
             instance, err = cluster:new(config)
             assert(not instance and err, "rotated client unexpectedly connected to closed port")
-            assert((dict:get(key) or 0) > 3, "configuration update removed the failure record")
+            assert((dict:get(key) or 0) > 3, "rotated connection failure was not recorded")
         end
         for _, candidate in ipairs(dict:get_keys(0)) do
             assert(type(dict:get(candidate)) == "number",

@@ -39,6 +39,19 @@ local function generate_key(name, ip, port)
 end
 
 
+local function health_key(config, ip, port)
+    local opts = config.connect_opts or {}
+    local settings = string.format("%q:%q:%q:%q:%q",
+        type(config.auth) .. ":" .. tostring(config.auth),
+        tostring(not not opts.ssl), tostring(not not opts.ssl_verify),
+        type(opts.server_name) .. ":" .. tostring(opts.server_name),
+        type(opts.pool) .. ":" .. tostring(opts.pool))
+    -- Old probes can only update their own settings' record, never a new one's.
+    return generate_key(config.name, ip, port) .. ":config:"
+           .. ngx.encode_base64(ngx.sha1_bin(settings))
+end
+
+
 local function lock_probe(locks, key)
     local id, prefix = ngx.worker.id(), key .. ":wait:"
     local wait_key = prefix .. id
@@ -69,6 +82,10 @@ local function run_health_check()
             goto continue
         end
         local config = health_configs[node.name]
+        if key ~= health_key(config, node.ip, node.port) then
+            pending_nodes[key] = nil
+            goto continue
+        end
         -- Use the existing lock dictionary; slot cleanup only touches health records.
         local locks = ngx.shared[config.dict_name or DEFAULT_SHARED_DICT_NAME]
         local lock_key = "redis_cluster_probe_" .. key
@@ -111,8 +128,8 @@ local function run_health_check()
 end
 
 
-local function watch_node(ip, port, name)
-    pending_nodes[generate_key(name, ip, port)] = {name = name, ip = ip, port = port}
+local function watch_node(ip, port, config)
+    pending_nodes[health_key(config, ip, port)] = {name = config.name, ip = ip, port = port}
     if not health_timer_started then
         local ok, err = ngx.timer.every(1, health_check)
         health_timer_started = ok
@@ -123,13 +140,13 @@ local function watch_node(ip, port, name)
 end
 
 
-local function track_node_failure(ip, port, name)
+local function track_node_failure(ip, port, config)
     local dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
     if not dict then
         return
     end
-    if dict:incr(generate_key(name, ip, port), 1, 0, 60) then
-        watch_node(ip, port, name)
+    if dict:incr(health_key(config, ip, port), 1, 0, 60) then
+        watch_node(ip, port, config)
     end
 end
 
@@ -176,17 +193,17 @@ health_check = function(premature)
     end
 end
 
-local function is_node_healthy(ip, port, name)
+local function is_node_healthy(ip, port, config)
     local unhealthy_nodes_dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
     if not unhealthy_nodes_dict then
         return true
     end
 
-    local key = generate_key(name, ip, port)
+    local key = health_key(config, ip, port)
     local failures = unhealthy_nodes_dict:get(key)
     if failures then
         -- A replacement worker can adopt failures recorded by another worker.
-        watch_node(ip, port, name)
+        watch_node(ip, port, config)
     end
     return (failures or 0) <= 3
 end
@@ -251,7 +268,7 @@ local function try_hosts_slots(self, serv_list)
     for i = 1, #serv_list do
         local ip = serv_list[i].ip
         local port = serv_list[i].port
-        local is_healthy = is_node_healthy(ip, port, self.config.name)
+        local is_healthy = is_node_healthy(ip, port, self.config)
         if not is_healthy then
             goto continue
         end
@@ -278,7 +295,7 @@ local function try_hosts_slots(self, serv_list)
             end
             if err then
                 ngx.log(ngx.ERR,"unable to connect, attempt nr ", k, " : error: ", err)
-                track_node_failure(ip, port, self.config.name)
+                track_node_failure(ip, port, self.config)
                 table_insert(errors, err)
             end
         end
@@ -419,7 +436,8 @@ function _M.refresh_slots(self)
         -- Cleanup stale nodes
         local all_keys = unhealthy_nodes_dict:get_keys()
         for _, key in ipairs(all_keys) do
-            if not current_nodes[key] then
+            local node_key = key:match("^(.*):config:[^:]+=$") or key
+            if not current_nodes[node_key] then
                 unhealthy_nodes_dict:delete(key)
             end
         end
@@ -503,7 +521,7 @@ local function pick_node(self, serv_list, slot, magic_radom_seed)
     local healthy_servers = {}
     for i, node in ipairs(serv_list) do
         -- first node here is master. If its unhealthy then we should return err
-        local is_healthy = is_node_healthy(node.ip, node.port, self.config.name)
+        local is_healthy = is_node_healthy(node.ip, node.port, self.config)
         if i == 1 and not is_healthy then
             return nil, nil, nil, err_unhealthy_master
         end
@@ -636,7 +654,7 @@ local function handle_command_with_retry(self, target_ip, target_port, asking, c
                                   config.read_timeout or DEFAULT_READ_TIMEOUT)
         local ok, connerr = redis_client:connect(ip, port, self.config.connect_opts)
         if not ok then
-            track_node_failure(ip, port, self.config.name)
+            track_node_failure(ip, port, self.config)
         end
         if ok then
             local authok, autherr = check_auth(self, redis_client)
@@ -700,7 +718,7 @@ local function handle_command_with_retry(self, target_ip, target_port, asking, c
                     return nil, err
                 else
                     --There might be node fail, we should also refresh slot cache
-                    track_node_failure(ip, port, self.config.name)
+                    track_node_failure(ip, port, self.config)
                     self:refresh_slots()
                     return nil, err
                 end
