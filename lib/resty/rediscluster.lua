@@ -39,22 +39,6 @@ local function generate_key(name, ip, port)
 end
 
 
--- Compare values, since callers can create equivalent option tables per request.
-local function same_config(a, b)
-    if a.auth ~= b.auth then
-        return false
-    end
-    local x, y = a.connect_opts or {}, b.connect_opts or {}
-    for key, value in pairs(x) do
-        if y[key] ~= value then return false end
-    end
-    for key, value in pairs(y) do
-        if x[key] ~= value then return false end
-    end
-    return true
-end
-
-
 local function lock_probe(locks, key)
     local id, prefix = ngx.worker.id(), key .. ":wait:"
     local wait_key = prefix .. id
@@ -80,8 +64,7 @@ end
 local function run_health_check()
     local dict = ngx.shared[DEFAULT_HEALTH_DICT_NAME]
     for key, node in pairs(pending_nodes) do
-        local failures = dict:get(key)
-        if not failures then
+        if not dict:get(key) then
             pending_nodes[key] = nil
             goto continue
         end
@@ -111,10 +94,6 @@ local function run_health_check()
             goto continue
         end
         locks:expire(lock_key, math.max(0.001, lease + 1 - ngx.now()))
-        if not same_config(config, health_configs[node.name])
-            or dict:get(key) ~= failures then
-            goto continue
-        end
         if ok then
             dict:delete(key)
             pending_nodes[key] = nil
@@ -509,13 +488,8 @@ function _M.new(_, config)
 
 
     -- Keep credentials local and preserve non-JSON connection options.
-    local opts
-    if config.connect_opts then
-        opts = {}
-        for key, value in pairs(config.connect_opts) do opts[key] = value end
-    end
     health_configs[config.name] = {
-        auth = config.auth, connect_opts = opts, dict_name = config.dict_name,
+        auth = config.auth, connect_opts = config.connect_opts, dict_name = config.dict_name,
     }
     local inst = { config = config }
     inst = setmetatable(inst, mt)

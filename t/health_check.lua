@@ -150,11 +150,13 @@ test("TLS options and AUTH remain local, including non-JSON options", function()
         assert(type(health:get(k)) == "number", "configuration leaked to shm")
     end
     down, password = false, "secret"
+    opts.server_name = "updated.example"
     assert(w.tick, "worker timer was not started")
     w.tick(false)
     assert(not health:get(key), "healthy authenticated node was not recovered")
     local actual = connects[#connects]
     assert(actual.ssl and actual.ssl_verify and actual.client_cert == cert)
+    assert(actual.server_name == "updated.example", "probe used outdated connection options")
     assert(auths[1] == password and closes == 1)
     local before = #connects
     now = now + 6
@@ -173,16 +175,16 @@ test("latest registration wins over a late failure from an older client", functi
     assert(auths[1] == "new" and not health:get(key))
 end)
 
-test("in-flight results do not overwrite a new local configuration", function()
+test("a failed in-flight probe retries with the latest credentials", function()
     local w = worker()
     fail(w, "old")
-    down, password = false, "old"
+    down, password = false, "new"
     hook = function() w:client("new") end
     w.tick(false)
-    assert(health:get(key) == 4, "stale success cleared the failure")
-    now, password = now + 6, "new"
+    assert(auths[1] == "old" and health:get(key) == 5, "failed probe was not counted")
+    now = now + 6
     w.tick(false)
-    assert(not health:get(key), "new credentials did not recover")
+    assert(auths[2] == "new" and not health:get(key), "new credentials did not recover")
 end)
 
 test("equivalent connection settings survive a lock dictionary change", function()
@@ -298,13 +300,13 @@ test("an expired probe cannot change its successor's lock or failure", function(
     assert(locks:get(lock_key), "expired probe shortened its successor's lease")
 end)
 
-test("a new failure during a successful probe is preserved", function()
+test("a successful probe clears failures recorded during the probe", function()
     local w = worker()
     fail(w)
     down = false
     hook = function() health:incr(key, 1) end
     w.tick(false)
-    assert(health:get(key) == 5, "success erased a newer failure")
+    assert(not health:get(key), "successful probe did not clear the failure record")
 end)
 
 test("a deleted counter is not resurrected by a failing probe", function()
