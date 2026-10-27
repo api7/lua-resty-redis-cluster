@@ -37,4 +37,3 @@ Thumbs.db
 luacov*
 *.out
 t/servroot
-t/fixtures-run/
