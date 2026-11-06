@@ -207,19 +207,25 @@ local function redis_slot(str)
 end
 
 check_auth = function(self, redis_client)
-    if type(self.config.auth) == "string" then
+    local auth = self.config.auth
+    local auth_type = type(auth)
+    local password = auth_type == "table" and auth.password or auth
+    local username = auth_type == "table" and auth.username or nil
+    if type(password) == "string" then
         local count, err = redis_client:get_reused_times()
         if count == 0 then
             local _
-            _, err = redis_client:auth(self.config.auth)
+            if type(username) == "string" then
+                _, err = redis_client:auth(username, password)
+            else
+                _, err = redis_client:auth(password)
+            end
         end
-
         if not err then
             return true, nil
         else
             return nil, err
         end
-
     else
         return true, nil
     end
