@@ -3,7 +3,7 @@ use Cwd qw(cwd);
 
 repeat_each(1);
 no_long_string();
-plan tests => repeat_each() * (2 * blocks());
+plan tests => repeat_each() * (2 * blocks() + 1);
 
 my $pwd = cwd();
 my $extra_lua_path = $ENV{TEST_REDIS_LUA_PATH} || "";
@@ -52,7 +52,10 @@ my $main_config = qq{
         }
         server {
             listen 127.0.0.1:17621 ssl;
-            ssl_certificate_by_lua_block { ngx.sleep(0.3) }
+            ssl_certificate_by_lua_block {
+                ngx.log(ngx.NOTICE, "slow TLS handshake started")
+                ngx.sleep(0.3)
+            }
             $fake_redis
         }
     }
@@ -109,10 +112,33 @@ connected
     }
 --- response_body_like chomp
 ^failed to fetch slots: failed to do ssl handshake: timeout(;failed to do ssl handshake: timeout)+$
+--- grep_error_log eval
+qr/slow TLS handshake started/
+--- grep_error_log_out
+slow TLS handshake started
+slow TLS handshake started
 
 
 
-=== TEST 3: command connects within the configured connect_timeout
+=== TEST 3: slot fetch without connect_timeout uses the 1000 ms default
+--- config
+    location /t {
+        content_by_lua_block {
+            local red, err = require("resty.rediscluster"):new({
+                name = "slow-seed-default",
+                serv_list = { { ip = "127.0.0.1", port = 17621 } },
+                connect_opts = { ssl = true },
+                max_connection_attempts = 1,
+            })
+            ngx.say(red and "connected" or err)
+        }
+    }
+--- response_body
+connected
+
+
+
+=== TEST 4: command connects within the configured connect_timeout
 --- config
     location /t {
         content_by_lua_block {
@@ -132,7 +158,7 @@ ok
 
 
 
-=== TEST 4: command retries are bounded by the configured connect_timeout
+=== TEST 5: command retries are bounded by the configured connect_timeout
 --- config
     location /t {
         content_by_lua_block {
