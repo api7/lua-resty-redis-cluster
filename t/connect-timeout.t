@@ -16,15 +16,21 @@ my $fixtures = $ENV{TEST_REDIS_FIXTURE_DIR} or die "Set TEST_REDIS_FIXTURE_DIR; 
 my $fake_redis = q{
     content_by_lua_block {
         local sock = ngx.req.socket(true)
-        while true do
+        local function read_command()
             local line = sock:receive()
             if not line then return end
             local args = {}
             for i = 1, tonumber(line:sub(2)) do
-                local len = tonumber(sock:receive():sub(2))
-                args[i] = sock:receive(len):lower()
-                sock:receive(2)
+                local len = sock:receive()
+                local arg = len and sock:receive(tonumber(len:sub(2)) + 2)
+                if not arg then return end
+                args[i] = arg:sub(1, -3):lower()
             end
+            return args
+        end
+        while true do
+            local args = read_command()
+            if not args then return end
             local reply
             if args[1] == "cluster" and args[2] == "slots" then
                 reply = "*1\r\n*3\r\n:0\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:17621\r\n"
@@ -36,7 +42,7 @@ my $fake_redis = q{
             else
                 reply = "-ERR unknown command\r\n"
             end
-            sock:send(reply)
+            if not sock:send(reply) then return end
         end
     }
 };
@@ -158,7 +164,26 @@ ok
 
 
 
-=== TEST 5: command retries are bounded by the configured connect_timeout
+=== TEST 5: command without connect_timeout uses the 1000 ms default
+--- config
+    location /t {
+        content_by_lua_block {
+            local red = assert(require("resty.rediscluster"):new({
+                name = "slow-node-default",
+                serv_list = { { ip = "127.0.0.1", port = 17620 } },
+                connect_opts = { ssl = true },
+                max_redirection = 1,
+            }))
+            local res, err = red:get("k")
+            ngx.say(res or err)
+        }
+    }
+--- response_body
+ok
+
+
+
+=== TEST 6: command retries are bounded by the configured connect_timeout
 --- config
     location /t {
         content_by_lua_block {
