@@ -1,0 +1,151 @@
+use Test::Nginx::Socket::Lua;
+use Cwd qw(cwd);
+
+repeat_each(1);
+no_long_string();
+plan tests => repeat_each() * (2 * blocks());
+
+my $pwd = cwd();
+my $extra_lua_path = $ENV{TEST_REDIS_LUA_PATH} || "";
+my $fixtures = $ENV{TEST_REDIS_FIXTURE_DIR} or die "Set TEST_REDIS_FIXTURE_DIR; see t/README.md\n";
+
+# Two fake single-node clusters speaking RESP over TLS. Both report
+# 127.0.0.1:17621 as the owner of every slot; only 17621 delays its TLS
+# handshake by 300 ms, so whether a connect to it succeeds depends on the
+# connect timeout that bounds the handshake.
+my $fake_redis = q{
+    content_by_lua_block {
+        local sock = ngx.req.socket(true)
+        while true do
+            local line = sock:receive()
+            if not line then return end
+            local args = {}
+            for i = 1, tonumber(line:sub(2)) do
+                local len = tonumber(sock:receive():sub(2))
+                args[i] = sock:receive(len):lower()
+                sock:receive(2)
+            end
+            local reply
+            if args[1] == "cluster" and args[2] == "slots" then
+                reply = "*1\r\n*3\r\n:0\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:17621\r\n"
+            elseif args[1] == "cluster" and args[2] == "nodes" then
+                local nodes = "n1 127.0.0.1:17621@27621 myself,master - 0 0 1 connected 0-16383\n"
+                reply = "$" .. #nodes .. "\r\n" .. nodes .. "\r\n"
+            elseif args[1] == "get" then
+                reply = "$2\r\nok\r\n"
+            else
+                reply = "-ERR unknown command\r\n"
+            end
+            sock:send(reply)
+        end
+    }
+};
+
+my $main_config = qq{
+    stream {
+        lua_package_path "$pwd/lib/?.lua;;";
+        ssl_certificate $fixtures/server.crt;
+        ssl_certificate_key $fixtures/server.key;
+        server {
+            listen 127.0.0.1:17620 ssl;
+            $fake_redis
+        }
+        server {
+            listen 127.0.0.1:17621 ssl;
+            ssl_certificate_by_lua_block { ngx.sleep(0.3) }
+            $fake_redis
+        }
+    }
+};
+
+my $http_config = qq{
+    lua_package_path "$pwd/lib/?.lua;$extra_lua_path;;";
+    lua_shared_dict redis_cluster_slot_locks 64k;
+};
+
+add_block_preprocessor(sub {
+    my ($block) = @_;
+    $block->set_value("main_config", $main_config);
+    $block->set_value("http_config", $http_config);
+    $block->set_value("request", "GET /t");
+    $block->set_value("timeout", 10);
+});
+
+run_tests();
+__DATA__
+
+=== TEST 1: slot fetch connects within the configured connect_timeout
+--- config
+    location /t {
+        content_by_lua_block {
+            local red, err = require("resty.rediscluster"):new({
+                name = "slow-seed-1000",
+                serv_list = { { ip = "127.0.0.1", port = 17621 } },
+                connect_opts = { ssl = true },
+                connect_timeout = 1000,
+                max_connection_attempts = 1,
+            })
+            ngx.say(red and "connected" or err)
+        }
+    }
+--- response_body
+connected
+
+
+
+=== TEST 2: slot fetch retries are bounded by the configured connect_timeout
+--- config
+    location /t {
+        content_by_lua_block {
+            local red, err = require("resty.rediscluster"):new({
+                name = "slow-seed-200",
+                serv_list = { { ip = "127.0.0.1", port = 17621 } },
+                connect_opts = { ssl = true },
+                connect_timeout = 200,
+                max_connection_attempts = 2,
+            })
+            ngx.say(red and "connected" or err)
+        }
+    }
+--- response_body_like chomp
+^failed to fetch slots: failed to do ssl handshake: timeout;
+
+
+
+=== TEST 3: command connects within the configured connect_timeout
+--- config
+    location /t {
+        content_by_lua_block {
+            local red = assert(require("resty.rediscluster"):new({
+                name = "slow-node-1000",
+                serv_list = { { ip = "127.0.0.1", port = 17620 } },
+                connect_opts = { ssl = true },
+                connect_timeout = 1000,
+                max_redirection = 1,
+            }))
+            local res, err = red:get("k")
+            ngx.say(res or err)
+        }
+    }
+--- response_body
+ok
+
+
+
+=== TEST 4: command retries are bounded by the configured connect_timeout
+--- config
+    location /t {
+        content_by_lua_block {
+            local red = assert(require("resty.rediscluster"):new({
+                name = "slow-node-200",
+                serv_list = { { ip = "127.0.0.1", port = 17620 } },
+                connect_opts = { ssl = true },
+                connect_timeout = 200,
+                max_redirection = 2,
+            }))
+            local res, err = red:get("k")
+            ngx.say(res or err)
+        }
+    }
+--- response_body
+failed to do ssl handshake: timeout

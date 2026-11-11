@@ -259,8 +259,7 @@ local function try_hosts_slots(self, serv_list)
         local ok, err, max_connection_timeout_err
         --attempt to connect DEFAULT_MAX_CONNECTION_ATTEMPTS times to redis
         for k = 1, config.max_connection_attempts or DEFAULT_MAX_CONNECTION_ATTEMPTS do
-            local attempt_timeout = k == 1 and 100 or 800  -- 100ms first attempt, 800ms retry
-            redis_client:set_timeouts(attempt_timeout,
+            redis_client:set_timeouts(config.connect_timeout or DEFAULT_CONNECTION_TIMEOUT,
             config.send_timeout or DEFAULT_SEND_TIMEOUT,
             config.read_timeout or DEFAULT_READ_TIMEOUT)
             local total_connection_time_ms = (ngx.now() - start_time) * 1000
@@ -599,7 +598,6 @@ local function handle_command_with_retry(self, target_ip, target_port, asking, c
     key = tostring(key)
     local slot = redis_slot(key)
     for k = 1, config.max_redirection or DEFAULT_MAX_REDIRECTION do
-        local attempt_timeout = k == 1 and 100 or 800  -- 100ms first attempt, 800ms retry
         if k > 1 then
             ngx.log(ngx.WARN, "handle retry attempts:" .. k .. " for cmd:" .. cmd .. " key:" .. key)
         end
@@ -631,7 +629,7 @@ local function handle_command_with_retry(self, target_ip, target_port, asking, c
             end
         end
         local redis_client = redis:new()
-        redis_client:set_timeouts(attempt_timeout,
+        redis_client:set_timeouts(config.connect_timeout or DEFAULT_CONNECTION_TIMEOUT,
                                   config.send_timeout or DEFAULT_SEND_TIMEOUT,
                                   config.read_timeout or DEFAULT_READ_TIMEOUT)
         local ok, connerr = redis_client:connect(ip, port, self.config.connect_opts)

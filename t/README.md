@@ -35,6 +35,14 @@ shared dictionary stores numeric counters, not serialized connection settings.
 These fixtures test health probes, not slot routing.
 Expected connection errors are part of fault injection.
 
+## Connect timeout tests
+
+`t/connect-timeout.t` starts fake single-node clusters inside the test nginx
+(stream ports 17620 and 17621) using the fixture certificate from
+`TEST_REDIS_FIXTURE_DIR`. Port 17621 delays its TLS handshake by 300 ms, so the
+cases check that `connect_timeout` bounds both the slot fetch and command
+connections, on the first attempt and on retries.
+
 ## Worker-state and interleaving tests
 
 ```sh
@@ -51,7 +59,7 @@ Changing endpoints under the same cluster name is outside this fix.
 
 ## Full Test::Nginx suite
 
-`make test` runs the worker-state/interleaving tests and both `t/sanity.t` and
+`make test` runs the worker-state/interleaving tests, `t/sanity.t`, `t/connect-timeout.t` and
 `t/health-check.t`. In addition to the health
 fixtures above, the existing sanity suite requires a disposable Redis Cluster
 reachable through localhost ports 7000 onward. It performs destructive commands
