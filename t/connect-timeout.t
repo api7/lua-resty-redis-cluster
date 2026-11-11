@@ -108,7 +108,7 @@ connected
         }
     }
 --- response_body_like chomp
-^failed to fetch slots: failed to do ssl handshake: timeout;
+^failed to fetch slots: failed to do ssl handshake: timeout(;failed to do ssl handshake: timeout)+$
 
 
 
