@@ -15,14 +15,29 @@ my $fixtures = $ENV{TEST_REDIS_FIXTURE_DIR} or die "Set TEST_REDIS_FIXTURE_DIR; 
 # connect timeout that bounds the handshake.
 my $fake_redis = q{
     content_by_lua_block {
-        local sock = ngx.req.socket(true)
+        local sock, err = ngx.req.socket(true)
+        if not sock then
+            ngx.log(ngx.ERR, "fake redis: failed to get the client socket: ", err)
+            return
+        end
+        local function check(ok, err, op)
+            -- The client closing its connection is how every session ends.
+            if not ok and err ~= "closed" then
+                ngx.log(ngx.ERR, "fake redis: failed to ", op, ": ", err)
+            end
+            return ok
+        end
+        local function read(size)
+            local data, err = sock:receive(size or "*l")
+            return check(data, err, "read")
+        end
         local function read_command()
-            local line = sock:receive()
+            local line = read()
             if not line then return end
             local args = {}
             for i = 1, tonumber(line:sub(2)) do
-                local len = sock:receive()
-                local arg = len and sock:receive(tonumber(len:sub(2)) + 2)
+                local len = read()
+                local arg = len and read(tonumber(len:sub(2)) + 2)
                 if not arg then return end
                 args[i] = arg:sub(1, -3):lower()
             end
@@ -42,7 +57,8 @@ my $fake_redis = q{
             else
                 reply = "-ERR unknown command\r\n"
             end
-            if not sock:send(reply) then return end
+            local ok, err = sock:send(reply)
+            if not check(ok, err, "send") then return end
         end
     }
 };
